@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if ! command -v dms &>/dev/null; then
+  curl https://install.danklinux.com | sh
+fi
+
+sudo pacman -Syu --needed --noconfirm libnotify noto-fonts{,-emoji} pipewire{,-{alsa,audio,jack,pulse}} rustup
+
+if ! rustc -V &>/dev/null; then
+  rustup default stable
+fi
+
+if ! command -v paru &>/dev/null; then
+  tmpdir=$(mktemp -d)
+  git clone https://aur.archlinux.org/paru.git "$tmpdir"/paru
+  (cd "$tmpdir"/paru && makepkg -si --noconfirm)
+
+  rm -rf "$tmpdir"
+fi
+
+if ! command -v zen-browser &>/dev/null; then
+  paru -Syu --noconfirm zen-browser-bin
+fi

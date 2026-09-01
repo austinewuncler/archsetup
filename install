@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$SCRIPT_DIR/logger.sh"
+
+log_info "PRE-INSTALL"
+log_step "Checking internet connection"
+
+if ! ping -c1 -W2 ping.archlinux.org &>/dev/null; then
+  log_error "There's no internet connection"
+
+  exit 1
+fi
+
+log_step "Updating the system clock"
+echo
+timedatectl
+echo
+
+DISK="/dev/nvme0n1"
+
+log_warning "About to WIPE $DISK"
+echo
+lsblk "$DISK"
+echo
+confirm "Type 'yes' to continue:" || {
+  log_error "Aborted"
+  exit 1
+}
+echo
+
+log_step "Partitioning $DISK"
+
+BOOT_PARTITION_LABEL="ARCH"
+BOOT_PARTITION_SIZE="500MiB"
+ROOT_PARTITION_LABEL="root"
+ROOT_PARTITION_SIZE="50GiB"
+DATA_PARTITION_LABEL="data"
+
+parted --script "$DISK" mklabel gpt
+parted --script "$DISK" mkpart "$BOOT_PARTITION_LABEL" fat32 1MiB "$BOOT_PARTITION_SIZE"
+parted --script "$DISK" set 1 esp on
+parted --script "$DISK" mkpart "$ROOT_PARTITION_LABEL" btrfs "$BOOT_PARTITION_SIZE" "$ROOT_PARTITION_SIZE"
+parted --script "$DISK" mkpart "$DATA_PARTITION_LABEL" btrfs "$ROOT_PARTITION_SIZE" 100%
+
+partprobe "$DISK"
+sleep 2
+
+log_step "Formatting partitions"
+
+BOOT_PARTITION="${DISK}p1"
+ROOT_PARTITION="${DISK}p2"
+DATA_PARTITION="${DISK}p3"
+
+mkfs.fat -F32 -n "$BOOT_PARTITION_LABEL" "$BOOT_PARTITION" >/dev/null
+mkfs.btrfs --force --quiet --label "$ROOT_PARTITION_LABEL" "$ROOT_PARTITION"
+mkfs.btrfs --force --quiet --label "$DATA_PARTITION_LABEL" "$DATA_PARTITION"
+
+log_step "Mounting file systems"
+
+MOUNT_POINT="/mnt"
+
+log_step "Mounting $ROOT_PARTITION to $MOUNT_POINT"
+mount "$ROOT_PARTITION" "$MOUNT_POINT"
+
+log_step "Creating subvolumes on $ROOT_PARTITION"
+btrfs subvolume create "$MOUNT_POINT"/@{,home,var_{cache,log}}
+
+log_step "Unmounting $ROOT_PARTITION"
+umount "$MOUNT_POINT"
+
+log_step "Mounting $DATA_PARTITION to $MOUNT_POINT"
+mount "$DATA_PARTITION" "$MOUNT_POINT"
+
+log_step "Creating subvolumes on $DATA_PARTITION"
+btrfs subvolume create "$MOUNT_POINT"/@data{,_{appdata,downloads,media}}
+
+log_step "Unmounting $DATA_PARTITION"
+umount "$MOUNT_POINT"
+
+log_step "Mounting btrfs subvolumes with options"
+
+BTRFS_OPTIONS="compress=zstd,noatime"
+
+mount --options "$BTRFS_OPTIONS,subvol=@" "$ROOT_PARTITION" "$MOUNT_POINT"
+mount --mkdir --options "$BTRFS_OPTIONS,subvol=@data" "$DATA_PARTITION" "$MOUNT_POINT/data"
+mount --mkdir --options subvol=@data_appdata "$DATA_PARTITION" "$MOUNT_POINT/data/appdata"
+mount --mkdir --options subvol=@data_downloads "$DATA_PARTITION" "$MOUNT_POINT/data/downloads"
+mount --mkdir --options subvol=@data_media "$DATA_PARTITION" "$MOUNT_POINT/data/media"
+mount --mkdir --options subvol=@home "$ROOT_PARTITION" "$MOUNT_POINT/home"
+mount --mkdir --options subvol=@var_cache "$ROOT_PARTITION" "$MOUNT_POINT/var/cache"
+mount --mkdir --options subvol=@var_log "$ROOT_PARTITION" "$MOUNT_POINT/var/log"
+
+log_step "Mounting boot partition"
+mount --mkdir "$BOOT_PARTITION" "$MOUNT_POINT/boot"
+echo
+
+log_info "INSTALLATION"
+log_step "Selecting mirrors"
+
+reflector --connection-timeout 60 --country "South Africa" --download-timeout 60 --latest 10 --protocol https --save /etc/pacman.d/mirrorlist --sort rate
+
+log_step "Installing packages"
+pacstrap -K "$MOUNT_POINT" base{,-devel} bluez{,-utils} btrfs-progs docker fish git intel-ucode linux{,-firmware} man-{db,pages} neovim networkmanager pkgfile refind sof-firmware terminus-font tuned{,-ppd}
+echo
+
+log_info "SYSTEM CONFIGURATION"
+log_step "Generating fstab"
+genfstab -U "$MOUNT_POINT" >>"$MOUNT_POINT/etc/fstab"
+
+log_step "Chrooting into the new environment"
+
+CHROOT_ROOT_DIR="$MOUNT_POINT/root"
+CHROOT_CONFIGURE_SCRIPT="$CHROOT_ROOT_DIR/configure.sh"
+
+cp "$SCRIPT_DIR"/{configure,logger}.sh "$CHROOT_ROOT_DIR"
+chmod +x "$CHROOT_CONFIGURE_SCRIPT"
+arch-chroot -S "$MOUNT_POINT" "${CHROOT_CONFIGURE_SCRIPT#"$MOUNT_POINT"}"
+rm "$CHROOT_ROOT_DIR"/{configure,logger}.sh
+
+umount --recursive /mnt
+
+log_info "Completed setup. Reboot to log into the new system"
